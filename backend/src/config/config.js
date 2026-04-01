@@ -25,10 +25,10 @@ const config = {
 
   // ─── Trading parameters ───────────────────────────────────────────────────
   trading: {
-    // Capital per trade as fraction of wallet balance (1–3%)
+    // Capital per trade as fraction of wallet balance (1–30%)
     tradeCapitalPct: parseFloat(process.env.TRADE_CAPITAL_PCT || '0.02'),
-    minTradeCapitalPct: 0.01,
-    maxTradeCapitalPct: 0.03,
+    minTradeCapitalPct: parseFloat(process.env.MIN_TRADE_CAPITAL_PCT || '0.01'),
+    maxTradeCapitalPct: parseFloat(process.env.MAX_TRADE_CAPITAL_PCT || '0.30'),
 
     // Minimum score to allow a buy (0–100)
     minScoreToBuy: parseInt(process.env.MIN_SCORE || '72'),

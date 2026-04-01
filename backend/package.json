@@ -13,8 +13,6 @@
   "dependencies": {
     "@solana/web3.js": "^1.91.0",
     "@solana/spl-token": "^0.4.0",
-    "@project-serum/anchor": "^0.29.0",
-    "@jup-ag/api": "^6.0.0",
     "axios": "^1.6.0",
     "ws": "^8.16.0",
     "express": "^4.18.0",
@@ -24,13 +22,10 @@
     "dotenv": "^16.4.0",
     "winston": "^3.11.0",
     "node-cron": "^3.0.3",
-    "bs58": "^5.0.0",
+    "bs58": "^4.0.1",
     "bn.js": "^5.2.1",
-    "node-fetch": "^3.3.2",
-    "p-queue": "^8.0.1",
     "sentiment": "^5.0.2",
     "natural": "^6.10.4",
-    "crypto": "^1.0.1",
     "uuid": "^9.0.0",
     "eventemitter3": "^5.0.1"
   },

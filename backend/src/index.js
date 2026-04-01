@@ -2,15 +2,18 @@
 
 require('dotenv').config();
 
-const config      = require('./config/config');
-const { getDb }   = require('./database/db');
+const config          = require('./config/config');
+const { getDb }       = require('./database/db');
 const { startRpcManager } = require('./dex/index');
-const TokenScanner  = require('./core/scanner');
-const TradingEngine = require('./core/trader');
-const CopyTrader    = require('./core/copytrader');
-const SocialMonitor = require('./social/social');
+const TokenScanner    = require('./core/scanner');
+const TradingEngine   = require('./core/trader');
+const CopyTrader      = require('./core/copytrader');
+const SocialMonitor   = require('./social/social');
+const KolTracker      = require('./social/kolTracker');
+const TelegramAlpha   = require('./social/telegramAlpha');
+const SignalAggregator = require('./social/signalAggregator');
 const { createApiServer } = require('./api/server');
-const logger        = require('./utils/logger');
+const logger          = require('./utils/logger');
 
 async function main() {
   logger.info('╔═══════════════════════════════════════════════╗');
@@ -31,10 +34,17 @@ async function main() {
   startRpcManager();
 
   // Build subsystems
-  const social    = new SocialMonitor();
-  const scanner   = new TokenScanner();
-  const engine    = new TradingEngine();
-  const copyTrader = new CopyTrader(engine);
+  const social       = new SocialMonitor();
+  const scanner      = new TokenScanner();
+  const engine       = new TradingEngine();
+  const copyTrader   = new CopyTrader(engine);
+
+  // KOL + Telegram alpha pipeline
+  const kolHandles   = (process.env.KOL_HANDLES || '').split(',').map(s => s.trim()).filter(Boolean);
+  const tgChannels   = (process.env.TELEGRAM_ALPHA_CHANNELS || process.env.TELEGRAM_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const kolTracker   = new KolTracker(kolHandles);
+  const tgAlpha      = new TelegramAlpha(tgChannels);
+  const signalAgg    = new SignalAggregator(kolTracker, tgAlpha);
 
   // Load wallet keypair
   if (process.env.WALLET_PRIVATE_KEY) {
@@ -58,9 +68,34 @@ async function main() {
     )
   );
 
-  // Social hype → enrich decisions (future: could bump tokens in watchlist)
+  // Social hype → enrich decisions
   social.on('hype', ({ mint, hypeScore, source, influencerCount }) => {
     logger.info('[Main] Hype alert', { mint, hypeScore, source, influencerCount });
+  });
+
+  // KOL/Telegram aggregated signal → process as high-priority token
+  signalAgg.on('actionableSignal', async (signal) => {
+    logger.info('[Main] Actionable signal received', {
+      address: signal.address ? signal.address.slice(0, 12) + '...' : null,
+      ticker: signal.ticker,
+      confidence: signal.confidence,
+      sources: signal.sources,
+    });
+
+    if (signal.address) {
+      // Treat confirmed CA as a new token candidate
+      try {
+        await engine.processNewToken({
+          mint:        signal.address,
+          symbol:      signal.ticker || 'UNKNOWN',
+          source:      signal.sources.join('+'),
+          socialBoost: signal.confidence,  // feeds into token score
+          ts:          signal.ts,
+        });
+      } catch (err) {
+        logger.error('[Main] processNewToken error from signal', { err: err.message });
+      }
+    }
   });
 
   // Suspicious pump → warn but don't reject automatically (Decision Engine handles it)
@@ -83,6 +118,8 @@ async function main() {
   engine.start();
   scanner.start();
   copyTrader.start();
+  kolTracker.start();
+  tgAlpha.start();
   api.start();
 
   logger.info(`[Main] All systems operational`);
@@ -95,6 +132,9 @@ async function main() {
     scanner.stop();
     copyTrader.stop();
     social.stop();
+    kolTracker.stop();
+    tgAlpha.stop();
+    signalAgg.stop();
     engine.stop();
     process.exit(0);
   };

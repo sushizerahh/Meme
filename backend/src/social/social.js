@@ -42,7 +42,6 @@ class SocialMonitor extends EventEmitter {
     this._tokenProfiles    = new Map();
 
     this._telegramOffset   = 0;
-    this._streamController = null;
     this._running          = false;
   }
 
@@ -51,10 +50,11 @@ class SocialMonitor extends EventEmitter {
     this._running = true;
     logger.info('[Social] Starting monitors...');
 
+    // Twitter filtered stream requires paid Basic plan (~$100/month).
+    // KolTracker uses the free /2/users/{id}/tweets polling endpoint instead.
+    // social.js focuses on Telegram + trend analytics only.
     if (config.social.twitterBearerToken) {
-      this._startTwitterStream().catch(err =>
-        logger.warn('[Social] Twitter error', { err: err.message })
-      );
+      logger.info('[Social] Twitter token present — KOL polling handled by KolTracker');
     } else {
       logger.warn('[Social] No Twitter token — Twitter disabled');
     }
@@ -73,8 +73,6 @@ class SocialMonitor extends EventEmitter {
 
   stop() {
     this._running = false;
-    this._streamController?.abort();
-    this._streamController = null;
   }
 
   /**
@@ -120,103 +118,6 @@ class SocialMonitor extends EventEmitter {
       .sort((a, b) => b[1] - a[1])
       .slice(0, limit)
       .map(([kw, score]) => ({ keyword: kw, score: Math.round(score) }));
-  }
-
-  // ── Twitter ───────────────────────────────────────────────────────────────
-
-  async _startTwitterStream() {
-    const RULES_URL  = 'https://api.twitter.com/2/tweets/search/stream/rules';
-    const STREAM_URL = 'https://api.twitter.com/2/tweets/search/stream';
-
-    await this._updateStreamRules(RULES_URL);
-    logger.info('[Social] Connecting Twitter stream...');
-
-    const controller = new AbortController();
-    this._streamController = controller;
-
-    try {
-      const resp = await axios.get(STREAM_URL, {
-        headers: { Authorization: `Bearer ${config.social.twitterBearerToken}` },
-        responseType: 'stream',
-        timeout: 0,
-        signal: controller.signal,
-        params: {
-          'tweet.fields': 'text,author_id,created_at,public_metrics',
-          'expansions':   'author_id',
-          'user.fields':  'public_metrics',
-        },
-      });
-
-      resp.data.on('data', chunk => {
-        const lines = chunk.toString().split('\n').filter(l => l.trim());
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.data) this._handleTweet(parsed.data, parsed.includes);
-          } catch {}
-        }
-      });
-
-      resp.data.on('end', () => {
-        if (this._running) {
-          logger.warn('[Social] Twitter stream ended — reconnect in 5s');
-          setTimeout(() => this._startTwitterStream(), 5000);
-        }
-      });
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        logger.warn('[Social] Twitter stream failed', { err: err.message });
-        if (this._running) setTimeout(() => this._startTwitterStream(), 10_000);
-      }
-    }
-  }
-
-  async _updateStreamRules(url) {
-    const headers = { Authorization: `Bearer ${config.social.twitterBearerToken}` };
-    try {
-      const existing = await axios.get(url, { headers });
-      const ids = (existing.data?.data || []).map(r => r.id);
-      if (ids.length) await axios.post(url, { delete: { ids } }, { headers });
-
-      await axios.post(url, {
-        add: [
-          { value: '(solana OR $SOL) (memecoin OR meme OR launch OR gem OR pump) lang:en -is:retweet', tag: 'sol_meme' },
-          { value: 'new token solana launch -is:retweet lang:en', tag: 'sol_launch' },
-        ],
-      }, { headers });
-    } catch (err) {
-      logger.debug('[Social] Twitter rules update failed', { err: err.message });
-    }
-  }
-
-  _handleTweet(tweet, includes) {
-    const text  = tweet.text || '';
-    const lower = text.toLowerCase();
-
-    // Update global narrative trends
-    for (const kw of NARRATIVE_KEYWORDS) {
-      if (lower.includes(kw)) {
-        this._globalTrends.set(kw, (this._globalTrends.get(kw) || 0) + 1);
-      }
-    }
-
-    // Extract follower count from includes
-    const author    = includes?.users?.find(u => u.id === tweet.author_id);
-    const followers = author?.public_metrics?.followers_count || 0;
-    const isInfluencer = followers >= INFLUENCER_FOLLOWER_MIN;
-
-    // Extract tickers
-    const tickers = text.match(/\$([A-Z]{2,12})/g) || [];
-    for (const ticker of tickers) {
-      const symbol  = ticker.slice(1);
-      const score   = sentiment.analyze(text).score;
-      this.emit('tweetMention', { symbol, text, sentiment: score, followers, isInfluencer, ts: Date.now() });
-
-      if (isInfluencer) {
-        logger.info('[Social] Influencer mention', { symbol, followers });
-        this.emit('influencerMention', { symbol, text, followers });
-      }
-    }
   }
 
   // ── Telegram ──────────────────────────────────────────────────────────────

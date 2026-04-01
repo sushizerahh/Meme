@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Solana Meme Trader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header>
+    <div class="logo">
+      <span class="logo-icon">◎</span>
+      <span class="logo-text">Meme Trader</span>
+    </div>
+    <div class="header-right">
+      <span id="ws-status" class="badge badge-offline">●  Offline</span>
+      <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <!-- ── Settings Panel ─────────────────────────────────────────────────── -->
+  <section id="settings-panel" class="panel hidden">
+    <h3>Connection</h3>
+    <div class="form-row">
+      <label>API URL</label>
+      <input type="text" id="api-url" placeholder="http://127.0.0.1:3001" />
+    </div>
+    <div class="form-row">
+      <label>API Key</label>
+      <input type="password" id="api-key" placeholder="your-api-key" />
+    </div>
+    <div class="form-row">
+      <button id="btn-save-config" class="btn btn-primary">Save & Connect</button>
+    </div>
+    <hr>
+    <h3>Trading Parameters</h3>
+    <div class="form-row">
+      <label>Min Score</label>
+      <input type="number" id="cfg-min-score" min="50" max="100" step="1" />
+    </div>
+    <div class="form-row">
+      <label>Trade Capital %</label>
+      <input type="number" id="cfg-capital-pct" min="1" max="3" step="0.1" />
+    </div>
+    <div class="form-row">
+      <label>Stop Loss %</label>
+      <input type="number" id="cfg-stop-loss" min="5" max="50" step="1" />
+    </div>
+    <div class="form-row">
+      <label>Max Daily Loss %</label>
+      <input type="number" id="cfg-daily-loss" min="1" max="20" step="0.5" />
+    </div>
+    <div class="form-row">
+      <button id="btn-update-config" class="btn btn-secondary">Update Config</button>
+    </div>
+  </section>
+
+  <!-- ── Stats Bar ──────────────────────────────────────────────────────── -->
+  <section class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" id="win-rate">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Daily P&L</div>
+      <div class="stat-value" id="daily-pnl">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="total-pnl">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Open</div>
+      <div class="stat-value" id="open-count">–</div>
+    </div>
+  </section>
+
+  <!-- ── Tab Navigation ─────────────────────────────────────────────────── -->
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="tab-positions">Positions</button>
+    <button class="tab-btn" data-tab="tab-tokens">Tokens</button>
+    <button class="tab-btn" data-tab="tab-trades">History</button>
+    <button class="tab-btn" data-tab="tab-hype">Hype</button>
+  </nav>
+
+  <!-- ── Tab: Open Positions ────────────────────────────────────────────── -->
+  <section id="tab-positions" class="tab-content active">
+    <div id="positions-list" class="item-list">
+      <div class="empty-msg">No open positions</div>
+    </div>
+  </section>
+
+  <!-- ── Tab: Watched Tokens ───────────────────────────────────────────── -->
+  <section id="tab-tokens" class="tab-content">
+    <div class="filter-bar">
+      <select id="token-filter">
+        <option value="">All</option>
+        <option value="watching">Watching</option>
+        <option value="bought">Bought</option>
+        <option value="skipped">Skipped</option>
+      </select>
+      <button id="btn-refresh-tokens" class="btn-sm">↻</button>
+    </div>
+    <div id="tokens-list" class="item-list">
+      <div class="empty-msg">No tokens</div>
+    </div>
+  </section>
+
+  <!-- ── Tab: Trade History ─────────────────────────────────────────────── -->
+  <section id="tab-trades" class="tab-content">
+    <div id="trades-list" class="item-list">
+      <div class="empty-msg">No trades yet</div>
+    </div>
+    <button id="btn-load-more" class="btn-sm full-width">Load more</button>
+  </section>
+
+  <!-- ── Tab: Hype / Social ─────────────────────────────────────────────── -->
+  <section id="tab-hype" class="tab-content">
+    <div class="section-header">Top Narratives</div>
+    <div id="narratives-list" class="tag-cloud"></div>
+    <div class="section-header">Recent Hype Alerts</div>
+    <div id="hype-list" class="item-list"></div>
+  </section>
+
+  <!-- ── Emergency Stop ────────────────────────────────────────────────── -->
+  <footer>
+    <button id="btn-emergency" class="btn btn-danger full-width">
+      ⚠ EMERGENCY STOP
+    </button>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

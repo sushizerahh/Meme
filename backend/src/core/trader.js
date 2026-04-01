@@ -1,411 +1,362 @@
 'use strict';
 
 /**
- * Trading Engine
+ * Trading Engine — Thin orchestration layer
  *
- * Orchestrates the full lifecycle:
- *   Token detected → Score → Anti-scam → Sniper delay → Buy → Monitor → Sell
- *
- * Exit triggers:
- *   • Take profit (partial, multi-level)
- *   • Stop loss
- *   • Trailing stop
- *   • Volume collapse
- *   • Liquidity drop
- *   • Holder growth stopped
- *   • Emergency stop
+ * Delegates ALL decision making to DecisionEngine.
+ * Delegates ALL exit logic to ExitStrategy.
+ * This file is responsible for:
+ *   • Coordinating the pipeline (scanner → decision → buy → monitor → exit)
+ *   • Executing Jupiter swaps
+ *   • Persisting positions & trades to DB
+ *   • Emitting events for the API/dashboard
  */
 
-const EventEmitter = require('eventemitter3');
+const EventEmitter   = require('eventemitter3');
 const { Keypair, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { v4: uuidv4 } = require('uuid');
-const bs58 = require('bs58');
+const bs58           = require('bs58');
 
-const config = require('../config/config');
+const config         = require('../config/config');
+const DecisionEngine = require('./decisionEngine');
+const ExitStrategy   = require('./exitStrategy');
+const RiskManager    = require('./risk');
 const { getJupiter, getRaydium } = require('../dex/index');
-const AntiScamFilter = require('../filters/antiscam');
-const TokenScorer = require('./scorer');
-const RiskManager = require('./risk');
 const {
-  upsertToken,
-  insertPosition,
-  updatePosition,
-  getOpenPositions,
-  insertTrade,
-  updateDailyStats,
-  logEvent,
-  isBlacklisted,
+  upsertToken, insertPosition, updatePosition,
+  getOpenPositions, insertTrade, logEvent, isBlacklisted,
 } = require('../database/db');
 const logger = require('../utils/logger');
 
+const { DECISION } = DecisionEngine;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 class TradingEngine extends EventEmitter {
   constructor() {
     super();
-    this.jupiter = getJupiter();
-    this.raydium = getRaydium();
-    this.antiscam = new AntiScamFilter();
-    this.scorer = new TokenScorer();
-    this.risk = new RiskManager();
+    this.risk     = new RiskManager();
+    this.decision = new DecisionEngine(this.risk);
+    this.exit     = new ExitStrategy(this.risk);
+    this.jupiter  = getJupiter();
+    this.raydium  = getRaydium();
 
-    this._keypair = null; // set via setKeypair()
+    this._keypair         = null;
     this._monitorInterval = null;
-    this._pendingTokens = new Map(); // mint → timer
-    this._running = false;
+    this._inProgress      = new Set(); // mints currently being evaluated
+    this._running         = false;
   }
 
-  /**
-   * Set the trading keypair (loaded from env, never stored).
-   * In browser mode, signing is delegated to Phantom via the extension.
-   * @param {string} privateKeyBase58
-   */
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
   setKeypair(privateKeyBase58) {
     this._keypair = Keypair.fromSecretKey(bs58.decode(privateKeyBase58));
-    logger.info('[Trader] Keypair loaded', { wallet: this._keypair.publicKey.toBase58() });
+    logger.info('[Trader] Wallet loaded', { address: this._keypair.publicKey.toBase58() });
   }
 
   getWalletAddress() {
-    return this._keypair?.publicKey?.toBase58() || null;
+    return this._keypair?.publicKey?.toBase58() ?? null;
   }
 
   start() {
     if (this._running) return;
     this._running = true;
-
-    // Monitor open positions every 3 seconds
-    this._monitorInterval = setInterval(() => this._monitorPositions(), 3000);
-    logger.info('[Trader] Trading engine started', { simulate: config.trading.simulate });
+    this._monitorInterval = setInterval(() => this._monitorPositions(), 3_000);
+    logger.info('[Trader] Engine started', { simulate: config.trading.simulate });
   }
 
   stop() {
     this._running = false;
     if (this._monitorInterval) clearInterval(this._monitorInterval);
-    for (const timer of this._pendingTokens.values()) clearTimeout(timer);
-    this._pendingTokens.clear();
-    logger.info('[Trader] Trading engine stopped');
+    logger.info('[Trader] Engine stopped');
   }
 
-  // ─── Entry pipeline ───────────────────────────────────────────────────────
+  // ── Entry pipeline ────────────────────────────────────────────────────────
 
   /**
-   * Process a newly detected token.
-   * Called by Scanner's 'newToken' event.
+   * Process a newly detected token through the full pipeline.
+   * Called by Scanner and CopyTrader.
    */
   async processNewToken(tokenInfo) {
     const { mint } = tokenInfo;
+    if (!this._running)          return;
+    if (this._inProgress.has(mint)) return; // already being evaluated
+    this._inProgress.add(mint);
 
-    if (!this._running) return;
-    if (this._pendingTokens.has(mint)) return;
-
-    logger.info('[Trader] Processing new token', { mint, symbol: tokenInfo.symbol });
-
-    // Quick blacklist check
-    if (isBlacklisted(mint)) return;
-
-    // Count open positions
-    const open = getOpenPositions();
-    if (open.length >= config.trading.maxPositions) {
-      logger.debug('[Trader] Max positions reached, skipping', { mint });
-      return;
-    }
-
-    // Risk check
-    const riskCheck = this.risk.canTrade();
-    if (!riskCheck.allowed) {
-      logger.warn('[Trader] Trade not allowed', { reason: riskCheck.reason });
-      return;
-    }
-
-    // Anti-scam fast check (synchronous cache lookup first)
-    const scamResult = await this.antiscam.check(tokenInfo);
-    if (!scamResult.pass) {
-      logger.info('[Trader] Token failed anti-scam', { mint, reasons: scamResult.reasons });
-      upsertToken({ ...tokenInfo, status: 'skipped', score: 0, score_detail: JSON.stringify(scamResult) });
-      return;
-    }
-
-    // Score the token
-    const scoreResult = await this.scorer.score(tokenInfo);
-    upsertToken({
-      mint,
-      symbol: tokenInfo.symbol || '???',
-      name: tokenInfo.name || '',
-      decimals: tokenInfo.decimals || 6,
-      deployer: tokenInfo.deployer || null,
-      launch_ts: tokenInfo.launch_ts || Math.floor(Date.now() / 1000),
-      score: scoreResult.total,
-      score_detail: JSON.stringify(scoreResult.breakdown),
-      status: scoreResult.passed ? 'queued' : 'skipped',
-    });
-
-    if (!scoreResult.passed) {
-      logger.info('[Trader] Token score too low', {
+    try {
+      // Persist token to DB (status: watching)
+      upsertToken({
         mint,
-        score: scoreResult.total,
-        minRequired: config.trading.minScoreToBuy,
+        symbol:       tokenInfo.symbol || '???',
+        name:         tokenInfo.name   || '',
+        decimals:     tokenInfo.decimals || 6,
+        deployer:     tokenInfo.deployer || null,
+        launch_ts:    tokenInfo.launch_ts || Math.floor(Date.now() / 1000),
+        score:        null,
+        score_detail: null,
+        status:       'watching',
       });
-      this.emit('tokenScored', { mint, score: scoreResult.total, passed: false });
-      return;
+
+      // Full decision pipeline (includes delay + re-validation)
+      const result = await this.decision.evaluate(tokenInfo);
+
+      // Update DB with decision outcome
+      upsertToken({
+        mint,
+        symbol:       tokenInfo.symbol || '???',
+        name:         tokenInfo.name   || '',
+        decimals:     tokenInfo.decimals || 6,
+        deployer:     tokenInfo.deployer || null,
+        launch_ts:    tokenInfo.launch_ts || Math.floor(Date.now() / 1000),
+        score:        result.score?.total ?? null,
+        score_detail: result.score ? JSON.stringify(result.score.breakdown) : null,
+        status:       result.decision === DECISION.BUY ? 'queued' : 'skipped',
+      });
+
+      this.emit('tokenScored', {
+        mint,
+        symbol:   tokenInfo.symbol,
+        score:    result.score?.total,
+        decision: result.decision,
+        reason:   result.reason,
+      });
+
+      if (result.decision === DECISION.HALT) {
+        logger.warn('[Trader] System halt from DecisionEngine', { reason: result.reason });
+        return;
+      }
+
+      if (result.decision !== DECISION.BUY) {
+        logger.debug('[Trader] Token rejected', { mint, decision: result.decision, reason: result.reason });
+        return;
+      }
+
+      // Execute buy
+      await this._executeBuy(tokenInfo, result);
+
+    } catch (err) {
+      logger.error('[Trader] processNewToken error', { mint, err: err.message });
+    } finally {
+      this._inProgress.delete(mint);
     }
-
-    this.emit('tokenScored', { mint, score: scoreResult.total, passed: true });
-    logger.info('[Trader] Token passed scoring – scheduling buy', {
-      mint, symbol: tokenInfo.symbol, score: scoreResult.total,
-    });
-
-    // Intelligent delay (10–30s) before entry
-    const delay = config.trading.sniperDelayMin +
-      Math.random() * (config.trading.sniperDelayMax - config.trading.sniperDelayMin);
-
-    const timer = setTimeout(async () => {
-      this._pendingTokens.delete(mint);
-      await this._executeBuy(tokenInfo, scoreResult);
-    }, delay);
-
-    this._pendingTokens.set(mint, timer);
-    logger.info('[Trader] Buy scheduled', { mint, delayMs: Math.round(delay) });
   }
 
-  // ─── Buy execution ────────────────────────────────────────────────────────
+  // ── Buy ────────────────────────────────────────────────────────────────────
 
-  async _executeBuy(tokenInfo, scoreResult) {
+  async _executeBuy(tokenInfo, decisionResult) {
     const { mint } = tokenInfo;
 
-    if (!this._running) return;
-    if (this.risk.isEmergencyStop()) return;
-
-    // Re-check limits just before buying
-    const riskCheck = this.risk.canTrade();
-    if (!riskCheck.allowed) {
-      logger.warn('[Trader] Buy cancelled – risk check failed', { mint, reason: riskCheck.reason });
-      return;
-    }
-
+    // Final balance / daily loss check
     if (await this.risk.isDailyLossLimitHit(this.getWalletAddress())) {
-      logger.warn('[Trader] Daily loss limit hit – halting buys');
+      logger.warn('[Trader] Daily loss limit — halting');
       this.risk.setEmergencyStop(true);
-      return;
-    }
-
-    // Re-check liquidity is still valid right before buying
-    const currentLiq = await this.raydium.getLiquidityUsd(mint).catch(() => 0);
-    if (currentLiq < config.filters.minLiquidityUsd) {
-      logger.info('[Trader] Liquidity dropped before buy', { mint, currentLiq });
       return;
     }
 
     const solAmount = await this.risk.calcPositionSize(this.getWalletAddress());
     if (solAmount < 0.001) {
-      logger.warn('[Trader] Insufficient balance for trade', { mint, solAmount });
+      logger.warn('[Trader] Insufficient balance', { solAmount });
       return;
     }
 
-    logger.info('[Trader] Executing buy', { mint, solAmount, simulate: config.trading.simulate });
-
     try {
-      const startMs = Date.now();
-      const result = await this.jupiter.buy({
-        tokenMint: mint,
+      const buyResult = await this.jupiter.buy({
+        tokenMint:    mint,
         solAmount,
-        keypair: this._keypair,
-        simulate: config.trading.simulate,
+        keypair:      this._keypair,
+        liquidityUsd: decisionResult.liquidityUsd,
+        simulate:     config.trading.simulate,
       });
-      const execMs = Date.now() - startMs;
 
-      const price = result.inAmount / result.outAmount;
-      const stopLoss = this.risk.calcStopLoss(price);
+      const price     = buyResult.inAmount / buyResult.outAmount;
+      const stopLoss  = this.exit.calcInitialStopLoss(price);
+      const posId     = uuidv4();
 
-      const positionId = uuidv4();
       const position = {
-        id: positionId,
+        id:            posId,
         mint,
-        symbol: tokenInfo.symbol || '???',
-        entry_price: price,
-        entry_amount: solAmount,
-        tokens_bought: result.outAmount,
-        stop_loss: stopLoss,
+        symbol:        tokenInfo.symbol || '???',
+        entry_price:   price,
+        entry_amount:  solAmount,
+        entry_liq_usd: decisionResult.liquidityUsd || 0,
+        tokens_bought: buyResult.outAmount,
+        remaining_pct: 1.0,
+        stop_loss:     stopLoss,
         trailing_stop: stopLoss,
-        simulated: config.trading.simulate ? 1 : 0,
+        simulated:     config.trading.simulate ? 1 : 0,
       };
 
       insertPosition(position);
       insertTrade({
-        id: uuidv4(),
-        position_id: positionId,
+        id:            uuidv4(),
+        position_id:   posId,
         mint,
-        side: 'buy',
+        side:          'buy',
         price,
-        amount_sol: solAmount,
-        amount_tokens: result.outAmount,
-        tx_sig: result.sig,
-        simulated: config.trading.simulate ? 1 : 0,
+        amount_sol:    solAmount,
+        amount_tokens: buyResult.outAmount,
+        tx_sig:        buyResult.sig,
+        simulated:     config.trading.simulate ? 1 : 0,
       });
 
-      upsertToken({ ...tokenInfo, status: 'bought', score: scoreResult.total, score_detail: JSON.stringify(scoreResult.breakdown) });
+      upsertToken({ ...tokenInfo, status: 'bought' });
 
-      logger.info('[Trader] Buy executed', {
-        mint, symbol: tokenInfo.symbol, solAmount, price, execMs, sig: result.sig,
+      logger.info('[Trader] Position opened', {
+        mint, symbol: tokenInfo.symbol,
+        solAmount, price,
+        latencyMs: buyResult.latencyMs,
+        slippageBps: buyResult.slippageBps,
+        sig: buyResult.sig,
       });
 
-      this.emit('buy', { positionId, mint, symbol: tokenInfo.symbol, solAmount, price, sig: result.sig });
+      this.emit('buy', {
+        positionId: posId, mint,
+        symbol: tokenInfo.symbol,
+        solAmount, price,
+        sig: buyResult.sig,
+        latencyMs: buyResult.latencyMs,
+      });
+
     } catch (err) {
       logger.error('[Trader] Buy failed', { mint, err: err.message });
       this.emit('buyError', { mint, err: err.message });
     }
   }
 
-  // ─── Position monitor ─────────────────────────────────────────────────────
+  // ── Position monitor ───────────────────────────────────────────────────────
 
   async _monitorPositions() {
     if (!this._running) return;
-
     const positions = getOpenPositions();
-    for (const pos of positions) {
-      await this._checkPosition(pos);
-    }
+    await Promise.allSettled(positions.map(pos => this._checkPosition(pos)));
   }
 
   async _checkPosition(pos) {
-    const { id, mint, entry_price, tokens_bought, remaining_pct, stop_loss, trailing_stop } = pos;
-
     try {
-      const currentPrice = await this.jupiter.getTokenPriceInSol(mint).catch(() => null);
-      if (!currentPrice) return;
+      // Fetch current price and pool info in parallel
+      const [currentPrice, poolInfo] = await Promise.allSettled([
+        this.jupiter.getTokenPriceInSol(pos.mint),
+        this.raydium.getPoolInfo(pos.mint),
+      ]);
 
-      // Update trailing stop
-      const newTrailingStop = this.risk.updateTrailingStop(entry_price, currentPrice, trailing_stop);
-      if (newTrailingStop !== trailing_stop) {
-        updatePosition(id, { trailing_stop: newTrailingStop });
-      }
+      const price = currentPrice.status === 'fulfilled' ? currentPrice.value : null;
+      const pool  = poolInfo.status  === 'fulfilled' ? poolInfo.value  : null;
 
-      const gainPct = (currentPrice - entry_price) / entry_price;
+      if (!price) return;
 
-      // ── Stop loss ────────────────────────────────────────────────────────
-      if (currentPrice <= stop_loss) {
-        await this._executeSell(pos, remaining_pct, 'stop_loss', currentPrice);
-        return;
-      }
-
-      // ── Trailing stop ─────────────────────────────────────────────────────
-      if (currentPrice <= newTrailingStop && gainPct > config.trading.trailingStopActivatePct) {
-        await this._executeSell(pos, remaining_pct, 'trailing_stop', currentPrice);
-        return;
-      }
-
-      // ── Take profit levels ────────────────────────────────────────────────
-      for (const tp of config.trading.takeProfitLevels) {
-        if (gainPct >= (tp.targetMul - 1) && remaining_pct > 0) {
-          const alreadySoldKey = `tp_${tp.targetMul}_sold`;
-          if (pos[alreadySoldKey]) continue;
-
-          const sellPct = Math.min(tp.pct, remaining_pct);
-          await this._executeSell(pos, sellPct, `take_profit_${tp.targetMul}x`, currentPrice);
-          // Mark this TP level as done
-          updatePosition(id, { [alreadySoldKey]: 1, remaining_pct: remaining_pct - sellPct });
-          break;
+      // Delegate to exit strategy
+      const signal = await this.exit.evaluate(pos, price, pool);
+      if (!signal || signal.trigger === 'hold') {
+        // Only update trailing stop if it changed
+        if (signal?.newTrailingStop && signal.newTrailingStop !== pos.trailing_stop) {
+          updatePosition(pos.id, { trailing_stop: signal.newTrailingStop });
         }
+        return;
       }
 
-      // ── Fundamental exit triggers ─────────────────────────────────────────
-      await this._checkFundamentalExits(pos, currentPrice);
+      if (signal.sellPct > 0) {
+        await this._executeSell(pos, signal, price);
+      }
     } catch (err) {
-      logger.debug('[Trader] Position monitor error', { positionId: id, err: err.message });
+      logger.debug('[Trader] Position monitor error', { posId: pos.id, err: err.message });
     }
   }
 
-  async _checkFundamentalExits(pos, currentPrice) {
-    const { id, mint, entry_price, remaining_pct } = pos;
-    if (remaining_pct <= 0) return;
+  // ── Sell ───────────────────────────────────────────────────────────────────
 
-    // Exit if liquidity dropped >50% from when we bought
-    const liq = await this.raydium.getLiquidityUsd(mint).catch(() => null);
-    if (liq !== null && liq < config.filters.minLiquidityUsd * 0.5) {
-      logger.warn('[Trader] Liquidity drop exit', { mint, liq });
-      await this._executeSell(pos, remaining_pct, 'liquidity_drop', currentPrice);
-      return;
-    }
-
-    // Exit if volume collapses (covered by raydium volume check in scorer, simplified here)
-    const vol = await this.raydium.getVolume24h(mint).catch(() => null);
-    if (vol !== null && vol < 500 && (currentPrice / entry_price) < 0.5) {
-      logger.info('[Trader] Volume collapse exit', { mint, vol });
-      await this._executeSell(pos, remaining_pct, 'volume_collapse', currentPrice);
-    }
-  }
-
-  // ─── Sell execution ───────────────────────────────────────────────────────
-
-  async _executeSell(pos, sellPct, reason, currentPrice) {
-    const { id, mint, tokens_bought, remaining_pct, entry_price, entry_amount, symbol } = pos;
-
-    if (remaining_pct <= 0) return;
+  async _executeSell(pos, signal, currentPrice) {
+    const { id, mint, tokens_bought, remaining_pct, entry_amount, entry_price, symbol } = pos;
+    const { trigger, sellPct, urgency, tpLevelIndex, newTrailingStop } = signal;
 
     const tokensToSell = Math.floor(tokens_bought * sellPct);
     if (tokensToSell < 1) return;
 
-    logger.info('[Trader] Selling', { mint, symbol, sellPct, reason, currentPrice });
-
     try {
-      const result = await this.jupiter.sell({
-        tokenMint: mint,
-        tokenAmount: tokensToSell,
-        keypair: this._keypair,
-        simulate: config.trading.simulate,
+      const sellResult = await this.jupiter.sell({
+        tokenMint:    mint,
+        tokenAmount:  tokensToSell,
+        keypair:      this._keypair,
+        liquidityUsd: pos.entry_liq_usd,
+        simulate:     config.trading.simulate,
       });
 
-      const solReceived = result.outAmount / LAMPORTS_PER_SOL;
-      const costBasis = entry_amount * sellPct;
-      const pnlSol = solReceived - costBasis;
-      const pnlPct = (pnlSol / costBasis) * 100;
-
-      const newRemainingPct = remaining_pct - sellPct;
-      const isClosed = newRemainingPct <= 0.01;
+      const solReceived   = sellResult.outAmount / LAMPORTS_PER_SOL;
+      const costBasis     = entry_amount * sellPct;
+      const pnlSol        = solReceived - costBasis;
+      const pnlPct        = costBasis > 0 ? (pnlSol / costBasis) * 100 : 0;
+      const newRemaining  = Math.max(0, remaining_pct - sellPct);
+      const isClosed      = newRemaining <= 0.01;
 
       insertTrade({
-        id: uuidv4(),
-        position_id: id,
+        id:            uuidv4(),
+        position_id:   id,
         mint,
-        side: 'sell',
-        price: currentPrice,
-        amount_sol: solReceived,
+        side:          'sell',
+        price:         currentPrice,
+        amount_sol:    solReceived,
         amount_tokens: tokensToSell,
-        tx_sig: result.sig,
-        simulated: config.trading.simulate ? 1 : 0,
+        tx_sig:        sellResult.sig,
+        simulated:     config.trading.simulate ? 1 : 0,
       });
 
+      const posUpdates = {
+        remaining_pct: newRemaining,
+        trailing_stop: newTrailingStop ?? pos.trailing_stop,
+      };
+
+      // Mark TP level as sold
+      if (tpLevelIndex !== undefined) {
+        posUpdates[`tp_${tpLevelIndex}_sold`] = 1;
+      }
+
       if (isClosed) {
-        updatePosition(id, {
-          status: 'closed',
-          remaining_pct: 0,
-          close_ts: Math.floor(Date.now() / 1000),
-          pnl_sol: pnlSol,
-          pnl_pct: pnlPct,
-          exit_reason: reason,
+        Object.assign(posUpdates, {
+          status:      'closed',
+          close_ts:    Math.floor(Date.now() / 1000),
+          pnl_sol:     pnlSol,
+          pnl_pct:     pnlPct,
+          exit_reason: trigger,
         });
         this.risk.recordTradeResult(pnlSol);
-        logger.info('[Trader] Position closed', { mint, symbol, pnlSol: pnlSol.toFixed(4), pnlPct: pnlPct.toFixed(1), reason });
-        this.emit('positionClosed', { positionId: id, mint, symbol, pnlSol, pnlPct, reason });
+
+        // Feed outcome back to scorer for adaptive learning
+        if (pos.score_detail) {
+          try {
+            const breakdown = JSON.parse(pos.score_detail);
+            this.decision.scorer.updateWeightsFromOutcome(breakdown, pnlSol > 0);
+          } catch { /* non-fatal */ }
+        }
+
+        logger.info(`[Trader] Position closed ${pnlSol > 0 ? '✅' : '❌'}`, {
+          symbol, pnlSol: pnlSol.toFixed(4), pnlPct: pnlPct.toFixed(1) + '%', trigger,
+        });
+        this.emit('positionClosed', { positionId: id, mint, symbol, pnlSol, pnlPct, trigger });
       } else {
-        updatePosition(id, { remaining_pct: newRemainingPct });
-        logger.info('[Trader] Partial sell', { mint, sellPct, remaining: newRemainingPct, reason });
-        this.emit('partialSell', { positionId: id, mint, symbol, sellPct, pnlSol, reason });
+        logger.info('[Trader] Partial sell', { symbol, sellPct: (sellPct * 100).toFixed(0) + '%', trigger, solReceived: solReceived.toFixed(4) });
+        this.emit('partialSell', { positionId: id, mint, symbol, sellPct, pnlSol, trigger });
       }
+
+      updatePosition(id, posUpdates);
+
     } catch (err) {
-      logger.error('[Trader] Sell failed', { mint, err: err.message });
-      this.emit('sellError', { mint, reason, err: err.message });
+      logger.error('[Trader] Sell failed', { mint, trigger, err: err.message });
+      this.emit('sellError', { mint, trigger, err: err.message });
     }
   }
 
-  // ─── Manual controls ──────────────────────────────────────────────────────
+  // ── Emergency ──────────────────────────────────────────────────────────────
 
   async emergencyCloseAll() {
-    logger.warn('[Trader] EMERGENCY CLOSE ALL');
+    logger.warn('[Trader] EMERGENCY CLOSE ALL POSITIONS');
     this.risk.setEmergencyStop(true);
+
     const positions = getOpenPositions();
     for (const pos of positions) {
       const price = await this.jupiter.getTokenPriceInSol(pos.mint).catch(() => 0);
-      await this._executeSell(pos, pos.remaining_pct, 'emergency', price || 0);
+      await this._executeSell(pos, {
+        trigger: 'emergency',
+        sellPct: pos.remaining_pct,
+        urgency: 'emergency',
+      }, price || 0);
     }
   }
 }

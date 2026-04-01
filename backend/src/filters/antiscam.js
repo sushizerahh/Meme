@@ -1,294 +1,256 @@
 'use strict';
 
 /**
- * Anti-Scam Filter Engine
+ * Anti-Scam Filter Engine — Deep validation before any buy
  *
- * Performs multi-layer validation before a token is eligible for purchase:
- *   1. Blacklist check (deployer / contract)
- *   2. Mint & freeze authority (renounced?)
- *   3. Honeypot simulation (can we sell?)
- *   4. Holder concentration check
- *   5. Rug-pull risk assessment
- *   6. Wash trading detection
- *   7. Contract age / deployer history
+ * Checks (in order of cost/importance):
+ *   1.  Blacklist                  – instant reject (O(1))
+ *   2.  Mint authority             – unlimited supply?
+ *   3.  Freeze authority           – tokens can be frozen?
+ *   4.  Honeypot simulation        – Jupiter round-trip sim
+ *   5.  Sell tax detection         – effective tax >15%?
+ *   6.  Holder concentration       – top-10 holders
+ *   7.  Dev wallet size            – deployer hoarding?
+ *   8.  Single whale               – one wallet >20%?
+ *   9.  Locked liquidity           – LP locked?
+ *   10. Rug pull indicators        – age + supply combo
+ *   11. Wash trading signal        – vol/liq extreme ratio
+ *   12. Deployer history           – serial rug-puller?
+ *   13. Contract age               – too new to trust?
+ *
+ * Risk scoring: 0 (clean) → 100 (certain scam)
+ * Pass threshold: riskScore < 40 AND no honeypot
  */
 
-const { PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const axios = require('axios');
-const config = require('../config/config');
+const { PublicKey }   = require('@solana/web3.js');
+const config          = require('../config/config');
 const { isBlacklisted, addBlacklist } = require('../database/db');
-const { getConnection, getJupiter } = require('../dex/index');
-const logger = require('../utils/logger');
+const { getConnection, getJupiter }   = require('../dex/index');
+const logger          = require('../utils/logger');
+
+const CACHE_TTL_MS = 5 * 60_000;
+const _cache       = new Map();   // mint → { ts, result }
+
+// Known lock programs on Solana
+const LOCK_PROGRAMS = new Set([
+  'LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE',  // Streamflow
+  'TLockFiRBxSNkuKqVbfCrPnpGcHjPqFh27TfhJj1GkH',  // Raydium lock
+  '7sPptkymzvayoSbLXzBsXEF8TSf3typNnAWkrKrDhjNm',  // Unicrypt
+]);
 
 class AntiScamFilter {
   constructor() {
-    this.jupiter = getJupiter();
     this.connection = getConnection();
-    // Cache results per mint to avoid redundant RPC calls
-    this._cache = new Map();
+    this.jupiter    = getJupiter();
   }
 
   /**
-   * Run all filters on a token.
-   * @param {object} tokenInfo  – { mint, deployer, symbol, ... }
-   * @returns {Promise<{pass: boolean, reasons: string[], score: number}>}
-   *   score = 0 (clean) to 100 (extreme risk)
+   * Run all checks on a token.
+   * @param {object} tokenInfo  – { mint, deployer, symbol, lockedLiqPct, ... }
+   * @returns {Promise<{pass: boolean, reasons: string[], riskScore: number}>}
    */
   async check(tokenInfo) {
     const { mint, deployer } = tokenInfo;
-    const cacheKey = mint;
 
-    if (this._cache.has(cacheKey)) return this._cache.get(cacheKey);
+    const cached = _cache.get(mint);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.result;
 
     const reasons = [];
-    let riskScore = 0;
+    let risk      = 0;
 
-    // ── 1. Blacklist ─────────────────────────────────────────────────────────
-    if (isBlacklisted(mint)) {
-      reasons.push('Contract blacklisted');
-      return this._fail(cacheKey, reasons, 100);
-    }
-    if (deployer && isBlacklisted(deployer)) {
-      reasons.push('Deployer blacklisted');
-      return this._fail(cacheKey, reasons, 100);
-    }
-    if (config.filters.blacklistContracts.includes(mint)) {
-      reasons.push('Contract in env blacklist');
-      return this._fail(cacheKey, reasons, 100);
-    }
-    if (deployer && config.filters.blacklistDeployers.includes(deployer)) {
-      reasons.push('Deployer in env blacklist');
-      return this._fail(cacheKey, reasons, 100);
-    }
+    // ── 1. Blacklist (O(1)) ───────────────────────────────────────────────
+    if (isBlacklisted(mint)) return this._cache(mint, this._fail(['Contract blacklisted'], 100));
+    if (deployer && isBlacklisted(deployer)) return this._cache(mint, this._fail(['Deployer blacklisted'], 100));
+    if (config.filters.blacklistContracts?.includes(mint))
+      return this._cache(mint, this._fail(['Contract in config blacklist'], 100));
+    if (deployer && config.filters.blacklistDeployers?.includes(deployer))
+      return this._cache(mint, this._fail(['Deployer in config blacklist'], 100));
 
-    // ── 2. Mint authority ────────────────────────────────────────────────────
+    // ── 2 & 3. On-chain mint info ─────────────────────────────────────────
     const mintInfo = await this._getMintInfo(mint);
-    if (!mintInfo) {
-      reasons.push('Cannot fetch mint info');
-      return this._fail(cacheKey, reasons, 80);
-    }
+    if (!mintInfo) return this._cache(mint, this._fail(['Cannot read mint account'], 80));
 
     if (config.filters.requireMintRenounced && mintInfo.mintAuthoritySet) {
-      reasons.push('Mint authority NOT renounced – unlimited supply possible');
-      riskScore += 35;
+      reasons.push('Mint authority active — unlimited supply possible');
+      risk += 35;
     }
     if (config.filters.requireFreezeRenounced && mintInfo.freezeAuthoritySet) {
-      reasons.push('Freeze authority NOT renounced – tokens can be frozen');
-      riskScore += 30;
+      reasons.push('Freeze authority active — tokens can be frozen');
+      risk += 30;
     }
 
-    // ── 3. Honeypot simulation ───────────────────────────────────────────────
-    const honeypot = await this._simulateHoneypot(mint);
-    if (honeypot.isHoneypot) {
-      reasons.push(`Honeypot detected: ${honeypot.reason}`);
-      addBlacklist(mint, 'contract', 'honeypot');
-      return this._fail(cacheKey, reasons, 100);
+    // ── 4 & 5. Honeypot + tax simulation (Jupiter round-trip) ─────────────
+    const sim = await this.jupiter.simulateRoundTrip(mint, 500_000);
+
+    if (!sim.canSell) {
+      addBlacklist(mint, 'contract', 'honeypot-no-sell');
+      return this._cache(mint, this._fail(['Cannot simulate sell — honeypot'], 100));
     }
-    if (honeypot.highTax) {
-      reasons.push(`High sell tax detected: ${honeypot.sellTaxPct.toFixed(1)}%`);
-      riskScore += 20;
+    if (sim.taxPct > 90) {
+      addBlacklist(mint, 'contract', `honeypot-tax-${sim.taxPct.toFixed(0)}pct`);
+      return this._cache(mint, this._fail([`Effective sell tax ${sim.taxPct.toFixed(1)}% — honeypot`], 100));
+    }
+    if (sim.taxPct > 20) {
+      reasons.push(`High sell tax ${sim.taxPct.toFixed(1)}%`);
+      risk += 25;
+    } else if (sim.taxPct > 10) {
+      reasons.push(`Moderate sell tax ${sim.taxPct.toFixed(1)}%`);
+      risk += 10;
     }
 
-    // ── 4. Holder concentration ──────────────────────────────────────────────
-    const holders = await this._getTopHolders(mint, mintInfo.supply);
+    // ── 6, 7, 8. Holder distribution ─────────────────────────────────────
+    const holders = await this._getHolderMetrics(mint, mintInfo.supply, deployer);
+
     if (holders.top10Pct > config.filters.maxTop10HoldersPct) {
-      reasons.push(
-        `Top-10 holders own ${(holders.top10Pct * 100).toFixed(1)}% – concentration risk`
-      );
-      riskScore += 25;
-    }
-    if (deployer && holders.devPct > config.filters.maxDevWalletPct) {
-      reasons.push(
-        `Dev wallet holds ${(holders.devPct * 100).toFixed(1)}% of supply`
-      );
-      riskScore += 30;
+      reasons.push(`Top-10 hold ${(holders.top10Pct * 100).toFixed(1)}% — whale risk`);
+      risk += 25;
     }
     if (holders.singleTopPct > 0.20) {
-      reasons.push(
-        `Single holder owns ${(holders.singleTopPct * 100).toFixed(1)}% – whale risk`
-      );
-      riskScore += 15;
+      reasons.push(`Largest holder owns ${(holders.singleTopPct * 100).toFixed(1)}%`);
+      risk += 15;
+    }
+    if (holders.devPct > config.filters.maxDevWalletPct) {
+      reasons.push(`Dev wallet holds ${(holders.devPct * 100).toFixed(1)}%`);
+      risk += 30;
     }
 
-    // ── 5. Rug-pull indicators ───────────────────────────────────────────────
-    const rugRisk = await this._assessRugRisk(tokenInfo, mintInfo, holders);
-    riskScore += rugRisk.score;
-    reasons.push(...rugRisk.flags);
-
-    // ── 6. Wash trading ──────────────────────────────────────────────────────
-    const washScore = await this._detectWashTrading(mint);
-    if (washScore > 50) {
-      reasons.push(`Wash trading detected (score: ${washScore})`);
-      riskScore += 15;
+    // ── 9. Locked liquidity check ─────────────────────────────────────────
+    const lockedPct = tokenInfo.lockedLiqPct ?? 0;
+    if (lockedPct < config.filters.minLockedLiquidityPct) {
+      reasons.push(`Only ${(lockedPct * 100).toFixed(0)}% LP locked (min ${(config.filters.minLockedLiquidityPct * 100).toFixed(0)}%)`);
+      risk += lockedPct < 0.3 ? 25 : 10;
     }
 
-    // ── 7. Deployer history ──────────────────────────────────────────────────
-    if (deployer) {
-      const devRisk = await this._checkDeployerHistory(deployer);
-      riskScore += devRisk.score;
-      reasons.push(...devRisk.flags);
-    }
-
-    const pass = riskScore < 40 && !reasons.some(r => r.toLowerCase().includes('honeypot'));
-    const result = { pass, reasons, riskScore };
-    this._cache.set(cacheKey, result);
-
-    if (!pass) {
-      logger.warn('[AntiScam] Token failed filters', { mint, riskScore, reasons });
-    } else {
-      logger.debug('[AntiScam] Token passed filters', { mint, riskScore });
-    }
-
-    return result;
-  }
-
-  // ─── Private helpers ──────────────────────────────────────────────────────
-
-  async _getMintInfo(mint) {
-    try {
-      const info = await this.connection.getParsedAccountInfo(new PublicKey(mint));
-      const parsed = info?.value?.data?.parsed?.info;
-      if (!parsed) return null;
-      return {
-        supply: BigInt(parsed.supply),
-        decimals: parsed.decimals,
-        mintAuthoritySet: !!parsed.mintAuthority,
-        freezeAuthoritySet: !!parsed.freezeAuthority,
-      };
-    } catch (err) {
-      logger.debug('[AntiScam] getMintInfo error', { mint, err: err.message });
-      return null;
-    }
-  }
-
-  async _simulateHoneypot(mint) {
-    // Attempt a tiny test swap simulation (buy 0.001 SOL then sell 100%)
-    // If sell quote returns 0 or much less than expected → honeypot
-    try {
-      const buyQuote = await this.jupiter.getQuote(
-        config.dex.wsolMint, mint, 1_000_000 // 0.001 SOL
-      );
-      if (!buyQuote || parseFloat(buyQuote.outAmount) === 0) {
-        return { isHoneypot: true, reason: 'Buy quote returned zero tokens' };
-      }
-
-      const outTokens = parseFloat(buyQuote.outAmount);
-      const sellQuote = await this.jupiter.getQuote(
-        mint, config.dex.wsolMint, Math.floor(outTokens * 0.99)
-      );
-
-      if (!sellQuote || parseFloat(sellQuote.outAmount) === 0) {
-        return { isHoneypot: true, reason: 'Cannot simulate sell – no route' };
-      }
-
-      const lamportsIn = 1_000_000;
-      const lamportsBack = parseFloat(sellQuote.outAmount);
-      const taxPct = (1 - lamportsBack / lamportsIn) * 100;
-
-      return {
-        isHoneypot: taxPct > 90,
-        highTax: taxPct > 15,
-        sellTaxPct: taxPct,
-        reason: taxPct > 90 ? `Effective sell tax ${taxPct.toFixed(1)}%` : '',
-      };
-    } catch (err) {
-      // If we can't simulate at all, that's itself suspicious
-      logger.debug('[AntiScam] honeypot sim error', { mint, err: err.message });
-      return { isHoneypot: false, highTax: false, sellTaxPct: 0, reason: 'sim_error' };
-    }
-  }
-
-  async _getTopHolders(mint, totalSupply) {
-    try {
-      const { value } = await this.connection.getTokenLargestAccounts(new PublicKey(mint));
-      const top = value.slice(0, 10);
-      const total = Number(totalSupply);
-
-      const amounts = top.map(a => Number(a.amount));
-      const top10Amount = amounts.reduce((s, v) => s + v, 0);
-      const top10Pct = top10Amount / total;
-      const singleTopPct = amounts[0] / total;
-
-      return { top10Pct, singleTopPct, devPct: 0, topHolders: value };
-    } catch {
-      return { top10Pct: 0, singleTopPct: 0, devPct: 0, topHolders: [] };
-    }
-  }
-
-  async _assessRugRisk(tokenInfo, mintInfo, holders) {
-    const flags = [];
-    let score = 0;
-
-    // No locked liquidity info (will be cross-checked by scorer)
-    if (tokenInfo.lockedLiqPct !== undefined && tokenInfo.lockedLiqPct < 0.50) {
-      flags.push(`Only ${(tokenInfo.lockedLiqPct * 100).toFixed(1)}% liquidity locked`);
-      score += 20;
-    }
-
-    // Token too new (< 30s) with large supply
+    // ── 10. Rug-pull combo indicators ─────────────────────────────────────
     const ageSeconds = tokenInfo.launch_ts
       ? Math.floor(Date.now() / 1000) - tokenInfo.launch_ts
       : 999;
-    if (ageSeconds < 30 && Number(mintInfo.supply) > 1e15) {
-      flags.push('Token <30s old with very large supply');
-      score += 10;
+
+    if (ageSeconds < 60 && Number(mintInfo.supply) > 1e15) {
+      reasons.push('Very new token (<60s) with huge supply');
+      risk += 10;
     }
 
-    return { score, flags };
+    // ── 11. Wash trading signal ───────────────────────────────────────────
+    if (tokenInfo.liquidityUsd && tokenInfo.volume24h) {
+      const ratio = tokenInfo.volume24h / tokenInfo.liquidityUsd;
+      if (ratio > 50) {
+        reasons.push(`Suspicious vol/liq ratio ${ratio.toFixed(0)}x`);
+        risk += 15;
+      }
+    }
+
+    // ── 12. Deployer history ──────────────────────────────────────────────
+    if (deployer) {
+      const devFlags = await this._checkDeployerReputation(deployer);
+      risk  += devFlags.risk;
+      reasons.push(...devFlags.reasons);
+    }
+
+    // ── 13. Token contract age ────────────────────────────────────────────
+    if (ageSeconds < 15) {
+      reasons.push('Token is less than 15 seconds old');
+      risk += 5;
+    }
+
+    const pass   = risk < 40;
+    const result = { pass, reasons, riskScore: risk };
+
+    if (!pass) logger.warn('[AntiScam] Failed', { mint, risk, reasons });
+    else       logger.debug('[AntiScam] Passed', { mint, risk });
+
+    return this._cache(mint, result);
   }
 
-  async _detectWashTrading(mint) {
-    // Heuristic: check if large fraction of volume comes from circular wallets
-    // Simplified: check volume/liquidity ratio – extremely high = suspicious
+  clearCache(mint) {
+    if (mint) _cache.delete(mint);
+    else _cache.clear();
+  }
+
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  async _getMintInfo(mint) {
     try {
-      const { getRaydium } = require('../dex/index');
-      const raydium = getRaydium();
-      const pool = await raydium.getPoolInfo(mint);
-      if (!pool) return 0;
+      const info   = await this.connection.getParsedAccountInfo(new PublicKey(mint));
+      const parsed = info?.value?.data?.parsed?.info;
+      if (!parsed) return null;
+      return {
+        supply:            BigInt(parsed.supply),
+        decimals:          parsed.decimals,
+        mintAuthoritySet:  !!parsed.mintAuthority,
+        freezeAuthoritySet: !!parsed.freezeAuthority,
+      };
+    } catch { return null; }
+  }
 
-      const vol = pool.volume24h || 0;
-      const liq = pool.tvl || 1;
-      const ratio = vol / liq;
+  async _getHolderMetrics(mint, totalSupply, deployer) {
+    try {
+      const { value } = await this.connection.getTokenLargestAccounts(new PublicKey(mint));
+      const top10     = value.slice(0, 10);
+      const total     = Number(totalSupply);
+      const amounts   = top10.map(a => Number(a.amount));
 
-      // Volume/liquidity > 50x in 24h is suspicious
-      if (ratio > 50) return 80;
-      if (ratio > 20) return 40;
-      return 0;
+      const top10Amount   = amounts.reduce((s, v) => s + v, 0);
+      const top10Pct      = total > 0 ? top10Amount / total : 0;
+      const singleTopPct  = total > 0 ? amounts[0] / total  : 0;
+
+      // Try to find deployer wallet in top holders
+      let devPct = 0;
+      if (deployer) {
+        for (const holder of top10) {
+          try {
+            const info = await this.connection.getParsedAccountInfo(holder.address);
+            const owner = info?.value?.data?.parsed?.info?.owner;
+            if (owner === deployer) {
+              devPct = Number(holder.amount) / total;
+              break;
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      return { top10Pct, singleTopPct, devPct };
     } catch {
-      return 0;
+      return { top10Pct: 0, singleTopPct: 0, devPct: 0 };
     }
   }
 
-  async _checkDeployerHistory(deployer) {
-    const flags = [];
-    let score = 0;
+  async _checkDeployerReputation(deployer) {
+    const reasons = [];
+    let risk      = 0;
 
     try {
-      // Check how many tokens this deployer has launched
       const sigs = await this.connection.getSignaturesForAddress(
-        new PublicKey(deployer), { limit: 50 }
+        new PublicKey(deployer), { limit: 100 }
       );
 
-      // High tx count from a fresh wallet can be suspicious
-      if (sigs.length > 30) {
-        flags.push('Deployer has high recent transaction count');
-        score += 10;
+      // Serial deployer: many tokens launched rapidly = rug factory
+      const recentInHour = sigs.filter(s =>
+        s.blockTime && Date.now() / 1000 - s.blockTime < 3600
+      ).length;
+
+      if (recentInHour > 20) {
+        reasons.push(`Deployer has ${recentInHour} transactions in last hour — serial deployer`);
+        risk += 20;
       }
-    } catch {
-      // RPC errors are non-fatal
-    }
 
-    return { score, flags };
+      // Very fresh deployer wallet (< 50 lifetime txs) = throw-away wallet
+      if (sigs.length < 10) {
+        reasons.push('Deployer is a very fresh wallet (< 10 txns)');
+        risk += 10;
+      }
+    } catch { /* RPC errors are non-fatal */ }
+
+    return { reasons, risk };
   }
 
-  _fail(cacheKey, reasons, riskScore) {
-    const result = { pass: false, reasons, riskScore };
-    this._cache.set(cacheKey, result);
+  _fail(reasons, riskScore) {
+    return { pass: false, reasons, riskScore };
+  }
+
+  _cache(mint, result) {
+    _cache.set(mint, { ts: Date.now(), result });
     return result;
-  }
-
-  clearCache() {
-    this._cache.clear();
   }
 }
 

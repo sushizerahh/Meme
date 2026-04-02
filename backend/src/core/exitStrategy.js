@@ -22,6 +22,7 @@
 const config      = require('../config/config');
 const { getRaydium } = require('../dex/index');
 const logger      = require('../utils/logger');
+const devWatcher  = require('./devWatcher');
 
 /** @typedef {{ trigger: string, sellPct: number, urgency: 'normal'|'fast'|'emergency' }} ExitSignal */
 
@@ -29,6 +30,49 @@ class ExitStrategy {
   constructor(riskManager) {
     this.risk    = riskManager;
     this.raydium = getRaydium();
+
+    /**
+     * Mints that have triggered a devSellAlert but haven't been exited yet.
+     * @type {Map<string, object>}  mint → devSellAlert signal
+     */
+    this._pendingDevSellAlerts = new Map();
+
+    // Listen for dev sell alerts from DevWatcher singleton
+    devWatcher.on('devSellAlert', (signal) => {
+      logger.warn('[ExitStrategy] Dev sell alert received — flagging for exit', {
+        mint: signal.mint.slice(0, 8) + '...',
+        soldPct: (signal.soldPct * 100).toFixed(1) + '%',
+      });
+      this._pendingDevSellAlerts.set(signal.mint, signal);
+    });
+
+    devWatcher.on('devSellWarning', (signal) => {
+      logger.warn('[ExitStrategy] Dev sell warning received', {
+        mint: signal.mint.slice(0, 8) + '...',
+        soldPct: (signal.soldPct * 100).toFixed(1) + '%',
+      });
+    });
+  }
+
+  /**
+   * Call when a new position is opened so DevWatcher can monitor the dev wallet.
+   * @param {string} mint
+   * @param {string} devAddress
+   * @param {number} positionOpenTs – timestamp (ms)
+   */
+  onPositionOpened(mint, devAddress, positionOpenTs) {
+    if (devAddress) {
+      devWatcher.watch(mint, devAddress, positionOpenTs);
+    }
+  }
+
+  /**
+   * Call when a position is closed to stop monitoring the dev wallet.
+   * @param {string} mint
+   */
+  onPositionClosed(mint) {
+    devWatcher.unwatch(mint);
+    this._pendingDevSellAlerts.delete(mint);
   }
 
   /**
@@ -48,6 +92,15 @@ class ExitStrategy {
     // ── 1. Emergency stop ──────────────────────────────────────────────────
     if (this.risk.isEmergencyStop()) {
       return { trigger: 'emergency', sellPct: remaining_pct, urgency: 'emergency' };
+    }
+
+    // ── 1b. Dev sell alert ────────────────────────────────────────────────
+    if (this._pendingDevSellAlerts.has(position.mint)) {
+      const alert = this._pendingDevSellAlerts.get(position.mint);
+      logger.warn('[Exit] Dev sell alert — exiting position', {
+        mint: position.mint, soldPct: (alert.soldPct * 100).toFixed(1) + '%',
+      });
+      return { trigger: 'dev_sell_alert', sellPct: remaining_pct, urgency: 'emergency' };
     }
 
     // ── 2. Hard stop loss ─────────────────────────────────────────────────

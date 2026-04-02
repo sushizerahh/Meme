@@ -138,6 +138,10 @@ const config = {
     usdcMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   },
 
+  // ─── Smart Money wallets ──────────────────────────────────────────────────
+  // Comma-separated list of known profitable trader addresses to track on-chain.
+  smartWallets: (process.env.SMART_WALLETS || '').split(',').map(s => s.trim()).filter(Boolean),
+
   // ─── Copy trading ─────────────────────────────────────────────────────────
   copyTrading: {
     enabled: process.env.COPY_TRADING_ENABLED === 'true',

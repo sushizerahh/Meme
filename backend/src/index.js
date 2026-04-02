@@ -12,6 +12,7 @@ const SocialMonitor   = require('./social/social');
 const KolTracker      = require('./social/kolTracker');
 const TelegramAlpha   = require('./social/telegramAlpha');
 const SignalAggregator = require('./social/signalAggregator');
+const smartMoney      = require('./core/smartMoneyTracker');
 const { createApiServer } = require('./api/server');
 const logger          = require('./utils/logger');
 
@@ -98,6 +99,28 @@ async function main() {
     }
   });
 
+  // Smart money on-chain signal → process as high-priority token candidate
+  smartMoney.on('smartMoneySignal', async (signal) => {
+    logger.info('[Main] Smart money signal received', {
+      mint:       signal.mint.slice(0, 12) + '...',
+      count:      signal.count,
+      confidence: signal.confidence,
+      wallets:    signal.wallets.length,
+    });
+
+    try {
+      await engine.processNewToken({
+        mint:        signal.mint,
+        symbol:      'UNKNOWN',
+        source:      'smart_money',
+        socialBoost: signal.confidence,
+        ts:          signal.ts,
+      });
+    } catch (err) {
+      logger.error('[Main] processNewToken error from smart money signal', { err: err.message });
+    }
+  });
+
   // Suspicious pump → warn but don't reject automatically (Decision Engine handles it)
   social.on('suspiciousPump', ({ mint, totalMentions, source }) => {
     logger.warn('[Main] Suspected coordinated pump', { mint, totalMentions, source });
@@ -120,6 +143,7 @@ async function main() {
   copyTrader.start();
   kolTracker.start();
   tgAlpha.start();
+  smartMoney.start();
   api.start();
 
   logger.info(`[Main] All systems operational`);
@@ -135,6 +159,7 @@ async function main() {
     kolTracker.stop();
     tgAlpha.stop();
     signalAgg.stop();
+    smartMoney.stop();
     engine.stop();
     process.exit(0);
   };

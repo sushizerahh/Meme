@@ -27,6 +27,7 @@ const config          = require('../config/config');
 const { isBlacklisted, addBlacklist } = require('../database/db');
 const { getConnection, getJupiter }   = require('../dex/index');
 const logger          = require('../utils/logger');
+const deployerScore   = require('./deployerScore');
 
 const CACHE_TTL_MS = 5 * 60_000;
 const _cache       = new Map();   // mint → { ts, result }
@@ -145,6 +146,23 @@ class AntiScamFilter {
       const devFlags = await this._checkDeployerReputation(deployer);
       risk  += devFlags.risk;
       reasons.push(...devFlags.reasons);
+    }
+
+    // ── 12b. Deployer score (Helius-based historical launch analysis) ─────
+    if (deployer) {
+      try {
+        const ds = await deployerScore.score(deployer);
+        if (ds.score < 30) {
+          reasons.push(`Deployer score too low: ${ds.score}/100 — flags: ${ds.flags.join(', ')}`);
+          risk += 20;
+        } else if (ds.score < 50) {
+          reasons.push(`Deployer score borderline: ${ds.score}/100`);
+          risk += 10;
+        }
+        logger.debug('[AntiScam] Deployer score', { deployer: deployer.slice(0, 8), score: ds.score, flags: ds.flags });
+      } catch (err) {
+        logger.debug('[AntiScam] deployerScore check failed (non-fatal)', { err: err.message });
+      }
     }
 
     // ── 13. Token contract age ────────────────────────────────────────────

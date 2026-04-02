@@ -41,27 +41,22 @@ class SmartMoneyTracker extends EventEmitter {
     /** @type {string[]} */
     this._wallets = config.smartWallets || [];
 
-    /** Map<walletAddress, WebSocket> */
-    this._sockets = new Map();
-
-    /** Map<walletAddress, number> – subscription ID per socket */
-    this._subIds = new Map();
+    /** Single shared WebSocket for all wallets */
+    this._ws = null;
 
     /** Map<`${wallet}:${mint}`, number> – last seen timestamp for dedup */
     this._seen = new Map();
 
     /**
      * Aggregation buffer:
-     *   Map<mint, { wallets: Set<address>, firstTs: number, amount: number }>
+     *   Map<mint, { wallets: Set<address>, firstTs: number }>
      */
     this._mintBuys = new Map();
 
-    /** Map<walletAddress, number> – current backoff delay */
-    this._backoff = new Map();
+    /** Current backoff delay for reconnect (ms) */
+    this._backoff = BACKOFF_BASE;
 
     this._running = false;
-
-    // Periodically clean up stale dedup/aggregation entries
     this._cleanupInterval = null;
   }
 
@@ -83,9 +78,8 @@ class SmartMoneyTracker extends EventEmitter {
     this._running = true;
     logger.info('[SmartMoney] Starting smart money tracker', { wallets: this._wallets.length });
 
-    for (const wallet of this._wallets) {
-      this._connectWallet(wallet);
-    }
+    // Single connection monitors all wallets — avoids 429 rate limit
+    this._connect();
 
     this._cleanupInterval = setInterval(() => this._cleanup(), 60_000);
   }
@@ -101,9 +95,9 @@ class SmartMoneyTracker extends EventEmitter {
       this._cleanupInterval = null;
     }
 
-    for (const [wallet, ws] of this._sockets) {
-      try { ws.terminate(); } catch { /* ignore */ }
-      this._sockets.delete(wallet);
+    if (this._ws) {
+      try { this._ws.terminate(); } catch { /* ignore */ }
+      this._ws = null;
     }
 
     logger.info('[SmartMoney] Stopped');
@@ -112,10 +106,10 @@ class SmartMoneyTracker extends EventEmitter {
   // ── Private ─────────────────────────────────────────────────────────────────
 
   /**
-   * Open a Helius Enhanced WebSocket for one wallet address.
-   * @param {string} wallet
+   * Open ONE WebSocket connection monitoring all smart wallets simultaneously.
+   * Helius accountInclude supports multiple addresses — no need for separate connections.
    */
-  _connectWallet(wallet) {
+  _connect() {
     if (!this._running) return;
 
     const url = `wss://atlas-mainnet.helius-rpc.com/?api-key=${config.solana.heliusApiKey}`;
@@ -124,23 +118,24 @@ class SmartMoneyTracker extends EventEmitter {
     try {
       ws = new WebSocket(url);
     } catch (err) {
-      logger.warn('[SmartMoney] Failed to create WebSocket', { wallet: wallet.slice(0, 8), err: err.message });
-      this._scheduleReconnect(wallet);
+      logger.warn('[SmartMoney] Failed to create WebSocket', { err: err.message });
+      this._scheduleReconnect();
       return;
     }
 
-    this._sockets.set(wallet, ws);
+    this._ws = ws;
 
     ws.on('open', () => {
-      logger.debug('[SmartMoney] WS connected', { wallet: wallet.slice(0, 8) + '...' });
-      this._backoff.set(wallet, BACKOFF_BASE); // reset backoff on success
+      logger.info('[SmartMoney] WS connected — monitoring', { wallets: this._wallets.length });
+      this._backoff = BACKOFF_BASE; // reset backoff on success
 
-      const subscribeMsg = JSON.stringify({
+      // All wallets in a single subscription
+      ws.send(JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
         method: 'transactionSubscribe',
         params: [
-          { accountInclude: [wallet] },
+          { accountInclude: this._wallets },
           {
             commitment: 'confirmed',
             encoding: 'jsonParsed',
@@ -149,54 +144,50 @@ class SmartMoneyTracker extends EventEmitter {
             maxSupportedTransactionVersion: 0,
           },
         ],
-      });
-
-      ws.send(subscribeMsg);
+      }));
     });
 
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
-        this._handleMessage(wallet, msg);
+        this._handleMessage(msg);
       } catch (err) {
         logger.debug('[SmartMoney] Malformed WS message', { err: err.message });
       }
     });
 
     ws.on('error', (err) => {
-      logger.warn('[SmartMoney] WS error', { wallet: wallet.slice(0, 8) + '...', err: err.message });
+      logger.warn('[SmartMoney] WS error', { err: err.message });
     });
 
     ws.on('close', (code) => {
-      logger.warn('[SmartMoney] WS closed', { wallet: wallet.slice(0, 8) + '...', code });
-      this._sockets.delete(wallet);
-      this._scheduleReconnect(wallet);
+      logger.warn('[SmartMoney] WS closed', { code });
+      this._ws = null;
+      this._scheduleReconnect();
     });
   }
 
   /**
-   * Schedule a reconnect for a wallet with exponential backoff.
-   * @param {string} wallet
+   * Reconnect with exponential backoff.
    */
-  _scheduleReconnect(wallet) {
+  _scheduleReconnect() {
     if (!this._running) return;
 
-    const delay = Math.min(this._backoff.get(wallet) || BACKOFF_BASE, BACKOFF_MAX);
-    this._backoff.set(wallet, Math.min(delay * 2, BACKOFF_MAX));
+    const delay = Math.min(this._backoff, BACKOFF_MAX);
+    this._backoff = Math.min(this._backoff * 2, BACKOFF_MAX);
 
-    logger.info('[SmartMoney] Reconnecting', { wallet: wallet.slice(0, 8) + '...', delayMs: delay });
-    setTimeout(() => this._connectWallet(wallet), delay);
+    logger.info('[SmartMoney] Reconnecting', { delayMs: delay });
+    setTimeout(() => this._connect(), delay);
   }
 
   /**
    * Parse an incoming WebSocket message and look for SPL token purchases.
-   * @param {string} wallet
    * @param {object} msg
    */
-  _handleMessage(wallet, msg) {
-    // Subscription confirmation — store sub ID
+  _handleMessage(msg) {
+    // Subscription confirmation
     if (msg.result && typeof msg.result === 'number' && msg.id === 1) {
-      this._subIds.set(wallet, msg.result);
+      logger.debug('[SmartMoney] Subscribed', { subId: msg.result });
       return;
     }
 
@@ -204,9 +195,14 @@ class SmartMoneyTracker extends EventEmitter {
     const tx = msg?.params?.result?.transaction;
     if (!tx) return;
 
-    const meta = tx?.meta;
+    const meta    = tx?.meta;
     const message = tx?.transaction?.message;
     if (!meta || !message) return;
+
+    // Determine which of our wallets sent/received in this tx
+    const accountKeys = (message.accountKeys || []).map(a => a.pubkey || a);
+    const wallet = this._wallets.find(w => accountKeys.includes(w));
+    if (!wallet) return;
 
     // Check if any instruction involves the SPL Token program
     const instructions = message.instructions || [];

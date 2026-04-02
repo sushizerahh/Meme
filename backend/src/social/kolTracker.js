@@ -125,7 +125,19 @@ class KolTracker extends EventEmitter {
         logger.debug('[KOL] Resolved user ID', { handle: user.username, id: user.id });
       }
     } catch (err) {
-      logger.warn('[KOL] Failed to resolve user IDs', { err: err.message });
+      const status = err.response?.status;
+      if (status === 402 || status === 403 || status === 401) {
+        logger.warn(
+          '[KOL] Twitter API requires paid Basic plan ($100/mo) for user timeline polling. ' +
+          'KOL Twitter tracking disabled. Use TELEGRAM_ALPHA_CHANNELS for free alpha signals.'
+        );
+        this._running = false;
+      } else if (status === 429) {
+        logger.warn('[KOL] Twitter rate limit hit — will retry in 15min');
+        setTimeout(() => this._resolveUserIds(), 15 * 60_000);
+      } else {
+        logger.warn('[KOL] Failed to resolve user IDs', { err: err.message });
+      }
     }
   }
 
@@ -178,9 +190,13 @@ class KolTracker extends EventEmitter {
         await this._processTweet(handle, tweet);
       }
     } catch (err) {
-      if (err.response?.status === 429) {
-        logger.warn('[KOL] Rate limited — backing off', { handle });
-        await new Promise(r => setTimeout(r, 60_000)); // wait 1min
+      const status = err.response?.status;
+      if (status === 402 || status === 403) {
+        logger.warn('[KOL] Twitter paid plan required — disabling KOL tracker. Use Telegram alpha instead.');
+        this.stop();
+      } else if (status === 429) {
+        logger.warn('[KOL] Rate limited — backing off 15min', { handle });
+        await new Promise(r => setTimeout(r, 15 * 60_000));
       }
     }
   }
